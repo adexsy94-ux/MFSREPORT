@@ -589,142 +589,258 @@ def build_observations(
 # ============================================================
 
 def _identity_text(value: str) -> str:
+    """Normalize text used for donor matching without changing display text."""
     value = clean(value).lower()
-    return re.sub(r"\s+", " ", value).strip()
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
 
 
 def donor_identity(tx: Transaction) -> tuple[str, str, str]:
-    """Return a conservative donor key, display name and identity basis."""
-    originator = _identity_text(tx.originator_name)
+    """
+    Return the donor key, display name and identity basis.
+
+    Donor identity is based on the customer/donor information captured on the
+    payment first. This is intentionally different from Payment Sources, which
+    describes the bank/card that supplied the money.
+
+    Priority:
+      1. Customer email (stable across payment methods)
+      2. Customer name
+      3. Bank-transfer originator name (fallback only)
+      4. Source account (fallback only)
+      5. Transaction-specific unidentified key
+    """
     email = _identity_text(tx.customer_email)
     customer = _identity_text(tx.customer_name)
+    originator = _identity_text(tx.originator_name)
     account = _identity_text(tx.source_account)
 
+    # Prefer the donor/customer name for display, even when email is the key.
     display = (
-        clean(tx.originator_name)
-        or clean(tx.customer_name)
+        clean(tx.customer_name)
+        or clean(tx.originator_name)
         or clean(tx.customer_email)
         or clean(tx.source_account)
-        or 'Unidentified Donor'
+        or "Unidentified Donor"
     )
 
-    # For bank transfers, analyse the person/account that actually sent the funds.
-    if tx.payment_method == 'bank_transfer':
-        if originator:
-            return f'ORIGINATOR::{originator}', display, 'Bank transfer originator name'
-        if account:
-            return f'ACCOUNT::{account}', display, 'Bank transfer source account'
-
-    # For card/other channels, email is usually the most stable customer identifier.
     if email:
-        return f'EMAIL::{email}', display, 'Customer email'
+        return f"EMAIL::{email}", display, "Customer email"
+
     if customer:
-        return f'CUSTOMER::{customer}', display, 'Customer name'
+        return f"CUSTOMER::{customer}", display, "Customer name"
+
+    if tx.payment_method == "bank_transfer" and originator:
+        return f"ORIGINATOR::{originator}", display, "Bank transfer originator fallback"
+
     if account:
-        return f'ACCOUNT::{account}', display, 'Source account'
+        return f"ACCOUNT::{account}", display, "Source account fallback"
 
     fallback = clean(tx.txref) or clean(tx.txid) or tx.created.isoformat()
-    return f'UNIDENTIFIED::{fallback}', display, 'Unidentified / transaction specific'
+    return (
+        f"UNIDENTIFIED::{fallback}",
+        display,
+        "Unidentified / transaction specific",
+    )
 
 
 def funding_frequency_label(successful_count: int) -> str:
-    """Frequency is based on successful funding events only."""
+    """Frequency is based only on successfully funded transactions."""
     if successful_count >= 10:
-        return 'Very Frequent'
+        return "Very Frequent"
     if successful_count >= 4:
-        return 'Frequent'
+        return "Frequent"
     if successful_count >= 2:
-        return 'Repeat'
+        return "Repeat"
     if successful_count == 1:
-        return 'One-Time'
-    return 'No Successful Funding'
+        return "One-Time"
+    return "No Successful Funding"
 
 
 def build_donor_analysis(transactions: list[Transaction]) -> list[dict[str, Any]]:
     """
-    Build one row per donor + currency.
+    Build the donor summary from SUCCESSFUL transactions only.
 
-    Total Amount Funded = successful transaction value only.
-    Failed and pending values are reported separately.
-    Currencies are deliberately not combined.
+    Important rules:
+      - A donor appears only when at least one transaction is Successful.
+      - Total Amount Funded is the sum of successful transaction amounts only.
+      - Failed and pending attempts never increase Total Amount Funded.
+      - Failed/pending attempts are shown only as supplementary information for
+        a donor who has at least one successful funding transaction.
+      - Donors are split by currency; unlike currencies are never combined.
     """
-    groups = defaultdict(list)
-    metadata = {}
+    # All attempts are indexed so we can show failed/pending attempts alongside
+    # a donor that actually funded successfully.
+    all_groups: dict[tuple[str, str], list[Transaction]] = defaultdict(list)
+    successful_groups: dict[tuple[str, str], list[Transaction]] = defaultdict(list)
+    metadata: dict[str, dict[str, Any]] = {}
 
     for tx in transactions:
         donor_key, donor_name, basis = donor_identity(tx)
-        currency = tx.currency or 'UNKNOWN'
-        groups[(donor_key, currency)].append(tx)
+        currency = tx.currency or "UNKNOWN"
+        group_key = (donor_key, currency)
+
+        all_groups[group_key].append(tx)
+
+        if tx.status == "Successful":
+            successful_groups[group_key].append(tx)
 
         meta = metadata.setdefault(
             donor_key,
             {
-                'name': donor_name,
-                'basis': basis,
-                'emails': set(),
-                'originators': set(),
-                'accounts': set(),
+                "display_names": [],
+                "basis": basis,
+                "emails": set(),
+                "customer_names": set(),
+                "originators": set(),
+                "accounts": set(),
             },
         )
+
+        if donor_name and donor_name != "Unidentified Donor":
+            meta["display_names"].append(donor_name)
+        if tx.customer_name:
+            meta["customer_names"].add(clean(tx.customer_name))
         if tx.customer_email:
-            meta['emails'].add(clean(tx.customer_email))
+            meta["emails"].add(clean(tx.customer_email))
         if tx.originator_name:
-            meta['originators'].add(clean(tx.originator_name))
+            meta["originators"].add(clean(tx.originator_name))
         if tx.source_account:
-            meta['accounts'].add(clean(tx.source_account))
+            meta["accounts"].add(clean(tx.source_account))
 
-    rows = []
-    for (donor_key, currency), items in groups.items():
-        successful_items = [tx for tx in items if tx.status == 'Successful']
-        failed_items = [tx for tx in items if tx.status == 'Failed']
-        pending_items = [tx for tx in items if tx.status == 'Pending Validation']
-        other_items = [
-            tx for tx in items
-            if tx.status not in {'Successful', 'Failed', 'Pending Validation'}
+    rows: list[dict[str, Any]] = []
+
+    # Iterate successful_groups, not all_groups. This is the key correction.
+    for (donor_key, currency), successful_items in successful_groups.items():
+        all_items = all_groups[(donor_key, currency)]
+        failed_items = [tx for tx in all_items if tx.status == "Failed"]
+        pending_items = [
+            tx for tx in all_items if tx.status == "Pending Validation"
         ]
+        other_items = [
+            tx
+            for tx in all_items
+            if tx.status not in {"Successful", "Failed", "Pending Validation"}
+        ]
+
         meta = metadata[donor_key]
+
+        # Prefer a captured donor/customer name. If unavailable, use the first
+        # display value, then email. This prevents the bank/issuer from becoming
+        # the donor name.
+        if meta["customer_names"]:
+            donor_display = sorted(meta["customer_names"])[0]
+        elif meta["display_names"]:
+            donor_display = meta["display_names"][0]
+        elif meta["originators"]:
+            donor_display = sorted(meta["originators"])[0]
+        elif meta["emails"]:
+            donor_display = sorted(meta["emails"])[0]
+        else:
+            donor_display = "Unidentified Donor"
+
         success_count = len(successful_items)
+        total_amount_funded = sum(tx.amount for tx in successful_items)
 
-        rows.append({
-            'Donor / Funder': meta['name'],
-            'Currency': currency,
-            'Funding Frequency': funding_frequency_label(success_count),
-            'Total Attempts': len(items),
-            'Successful Funding Count': success_count,
-            'Failed / Unsuccessful Count': len(failed_items),
-            'Pending Validation Count': len(pending_items),
-            'Other Status Count': len(other_items),
-            'Total Amount Funded': sum(tx.amount for tx in successful_items),
-            'Failed Attempt Value': sum(tx.amount for tx in failed_items),
-            'Pending Attempt Value': sum(tx.amount for tx in pending_items),
-            'Total Attempted Value': sum(tx.amount for tx in items),
-            'Successful Funding Rate': percentage(success_count, len(items)),
-            'First Funding Attempt': min(tx.created for tx in items),
-            'Last Funding Attempt': max(tx.created for tx in items),
-            'Payment Method(s)': ' | '.join(sorted({tx.payment_method_label for tx in items if tx.payment_method_label})),
-            'Source / Issuer(s)': ' | '.join(sorted({tx.source for tx in items if tx.source})),
-            'Originator Name(s)': ' | '.join(sorted(meta['originators'])),
-            'Email(s)': ' | '.join(sorted(meta['emails'])),
-            'Masked Source Account(s)': ' | '.join(sorted(meta['accounts'])),
-            'Identity Basis': meta['basis'],
-        })
+        rows.append(
+            {
+                "Donor / Funder": donor_display,
+                "Currency": currency,
+                "Funding Frequency": funding_frequency_label(success_count),
+                "Successful Funding Count": success_count,
+                "Total Amount Funded": total_amount_funded,
+                "Average Successful Funding": (
+                    total_amount_funded / success_count if success_count else 0.0
+                ),
+                "First Successful Funding": min(
+                    tx.created for tx in successful_items
+                ),
+                "Last Successful Funding": max(
+                    tx.created for tx in successful_items
+                ),
+                "Failed / Unsuccessful Count": len(failed_items),
+                "Pending Validation Count": len(pending_items),
+                "Other Status Count": len(other_items),
+                "Total Attempts": len(all_items),
+                "Successful Funding Rate": percentage(
+                    success_count, len(all_items)
+                ),
+                "Payment Method(s)": " | ".join(
+                    sorted(
+                        {
+                            tx.payment_method_label
+                            for tx in successful_items
+                            if tx.payment_method_label
+                        }
+                    )
+                ),
+                "Source / Issuer(s)": " | ".join(
+                    sorted(
+                        {
+                            tx.source
+                            for tx in successful_items
+                            if tx.source
+                        }
+                    )
+                ),
+                "Originator Name(s)": " | ".join(sorted(meta["originators"])),
+                "Email(s)": " | ".join(sorted(meta["emails"])),
+                "Masked Source Account(s)": " | ".join(sorted(meta["accounts"])),
+                "Identity Basis": meta["basis"],
+            }
+        )
 
-    rows.sort(key=lambda r: (r['Currency'], -r['Total Amount Funded'], -r['Successful Funding Count'], r['Donor / Funder'].lower()))
+    rows.sort(
+        key=lambda row: (
+            row["Currency"],
+            -row["Total Amount Funded"],
+            -row["Successful Funding Count"],
+            row["Donor / Funder"].lower(),
+        )
+    )
+
     return rows
 
 
-def donor_summary_metrics(transactions: list[Transaction]) -> dict[str, int]:
-    grouped = defaultdict(list)
+def donor_summary_metrics(transactions: list[Transaction]) -> dict[str, Any]:
+    """Return donor KPIs based on successfully funded transactions."""
+    successful_transactions = [
+        tx for tx in transactions if tx.status == "Successful"
+    ]
+
+    successful_by_donor: dict[str, list[Transaction]] = defaultdict(list)
+    all_by_donor: dict[str, list[Transaction]] = defaultdict(list)
+
     for tx in transactions:
         donor_key, _, _ = donor_identity(tx)
-        grouped[donor_key].append(tx)
+        all_by_donor[donor_key].append(tx)
+        if tx.status == "Successful":
+            successful_by_donor[donor_key].append(tx)
+
+    successful_donor_keys = set(successful_by_donor)
+
+    currency_totals: dict[str, float] = defaultdict(float)
+    for tx in successful_transactions:
+        currency_totals[tx.currency or "UNKNOWN"] += tx.amount
 
     return {
-        'unique_donors': len(grouped),
-        'successful_donors': sum(any(tx.status == 'Successful' for tx in items) for items in grouped.values()),
-        'repeat_donors': sum(sum(tx.status == 'Successful' for tx in items) >= 2 for items in grouped.values()),
-        'donors_with_failures': sum(any(tx.status == 'Failed' for tx in items) for items in grouped.values()),
-        'donors_with_pending': sum(any(tx.status == 'Pending Validation' for tx in items) for items in grouped.values()),
+        # Kept for compatibility with existing Streamlit code, but this now
+        # means UNIQUE SUCCESSFUL donors, not everyone who attempted a payment.
+        "unique_donors": len(successful_donor_keys),
+        "successful_donors": len(successful_donor_keys),
+        "successful_funding_transactions": len(successful_transactions),
+        "repeat_donors": sum(
+            len(items) >= 2 for items in successful_by_donor.values()
+        ),
+        "donors_with_failures": sum(
+            any(tx.status == "Failed" for tx in all_by_donor[key])
+            for key in successful_donor_keys
+        ),
+        "donors_with_pending": sum(
+            any(tx.status == "Pending Validation" for tx in all_by_donor[key])
+            for key in successful_donor_keys
+        ),
+        "currency_totals": dict(sorted(currency_totals.items())),
     }
 
 
@@ -1769,104 +1885,179 @@ def write_sources_sheet(
 
 
 def write_donor_analysis_sheet(workbook, formats, transactions):
-    ws = workbook.add_worksheet('Donor Analysis')
+    ws = workbook.add_worksheet("Donor Analysis")
+
     add_title(
         ws,
         formats,
-        'DONOR / FUNDER ANALYSIS',
+        "SUCCESSFUL DONOR / FUNDER SUMMARY",
         (
-            'Who funded the account, how many times they funded, total successful amount funded, '
-            'and successful, failed and pending transactions by donor. Amounts remain in original currency.'
+            "Summary of funds successfully received from each donor/funder. "
+            "Only Successful transactions contribute to Total Amount Funded. "
+            "Amounts remain in their original currency."
         ),
-        20,
+        18,
     )
 
     rows = build_donor_analysis(transactions)
     metrics = donor_summary_metrics(transactions)
 
-    write_header(ws, 3, ['DONOR METRIC', 'RESULT'], formats)
+    write_header(ws, 3, ["DONOR METRIC", "RESULT"], formats)
     donor_kpis = [
-        ('Unique donors / funders', metrics['unique_donors']),
-        ('Donors with successful funding', metrics['successful_donors']),
-        ('Repeat donors (2+ successful fundings)', metrics['repeat_donors']),
-        ('Donors with failed attempts', metrics['donors_with_failures']),
-        ('Donors with pending attempts', metrics['donors_with_pending']),
+        ("Successful donors / funders", metrics["successful_donors"]),
+        ("Successful funding transactions", metrics["successful_funding_transactions"]),
+        ("Repeat donors (2+ successful fundings)", metrics["repeat_donors"]),
+        ("Successful donors with failed attempts", metrics["donors_with_failures"]),
+        ("Successful donors with pending attempts", metrics["donors_with_pending"]),
     ]
-    for r, (label, value) in enumerate(donor_kpis, start=4):
-        ws.write(r, 0, label, formats['body'])
-        ws.write_number(r, 1, value, formats['integer'])
 
-    ws.merge_range(3, 3, 3, 8, 'HOW TO READ THIS TAB', formats['section'])
+    for row_number, (label, value) in enumerate(donor_kpis, start=4):
+        ws.write(row_number, 0, label, formats["body"])
+        ws.write_number(row_number, 1, value, formats["integer"])
+
+    # Successful value by currency. We deliberately do not combine currencies.
+    write_header(ws, 3, ["CURRENCY", "SUCCESSFULLY FUNDED"], formats, start_col=3)
+    for row_number, (currency, amount) in enumerate(
+        metrics["currency_totals"].items(), start=4
+    ):
+        ws.write(row_number, 3, currency, formats["body"])
+        ws.write_number(row_number, 4, amount, formats["money"])
+
+    ws.merge_range(3, 6, 3, 11, "HOW THIS SUMMARY IS CALCULATED", formats["section"])
     ws.merge_range(
-        4, 3, 8, 8,
+        4,
+        6,
+        9,
+        11,
         (
-            '• Total Amount Funded = successful transaction value only.\n'
-            '• Failed / Unsuccessful Count = failed transaction attempts.\n'
-            '• Pending Validation is shown separately.\n'
-            '• Funding Frequency is based on successful funding events.\n'
-            '• Each donor is split by currency so unlike currencies are never added together.\n'
-            '• Bank transfers prioritise the captured originator/account name.'
+            "• A donor appears only when at least one transaction is Successful.\n"
+            "• Total Amount Funded = sum of Successful transaction amounts only.\n"
+            "• Failed and Pending transactions never increase the funded total.\n"
+            "• Donor identity uses customer email/name first; bank originator is only a fallback.\n"
+            "• The same customer email is grouped together across payment methods.\n"
+            "• Each donor is separated by currency; NGN, GBP, USD, CAD, etc. are never added together."
         ),
-        formats['note'],
+        formats["note"],
     )
 
-    table_row = 11
+    table_row = 12
     headers = [
-        'Donor / Funder', 'Currency', 'Funding Frequency', 'Total Attempts',
-        'Successful Funding Count', 'Failed / Unsuccessful Count', 'Pending Validation Count',
-        'Other Status Count', 'Total Amount Funded', 'Failed Attempt Value',
-        'Pending Attempt Value', 'Total Attempted Value', 'Successful Funding Rate',
-        'First Funding Attempt', 'Last Funding Attempt', 'Payment Method(s)',
-        'Source / Issuer(s)', 'Originator Name(s)', 'Email(s)',
-        'Masked Source Account(s)', 'Identity Basis',
+        "Donor / Funder",
+        "Currency",
+        "Funding Frequency",
+        "Successful Funding Count",
+        "Total Amount Funded",
+        "Average Successful Funding",
+        "First Successful Funding",
+        "Last Successful Funding",
+        "Failed / Unsuccessful Count",
+        "Pending Validation Count",
+        "Other Status Count",
+        "Total Attempts",
+        "Successful Funding Rate",
+        "Payment Method(s)",
+        "Source / Issuer(s)",
+        "Originator Name(s)",
+        "Email(s)",
+        "Masked Source Account(s)",
+        "Identity Basis",
     ]
+
     write_header(ws, table_row, headers, formats)
 
     integer_headers = {
-        'Total Attempts', 'Successful Funding Count', 'Failed / Unsuccessful Count',
-        'Pending Validation Count', 'Other Status Count',
+        "Successful Funding Count",
+        "Failed / Unsuccessful Count",
+        "Pending Validation Count",
+        "Other Status Count",
+        "Total Attempts",
     }
     money_headers = {
-        'Total Amount Funded', 'Failed Attempt Value',
-        'Pending Attempt Value', 'Total Attempted Value',
+        "Total Amount Funded",
+        "Average Successful Funding",
     }
-    date_headers = {'First Funding Attempt', 'Last Funding Attempt'}
+    date_headers = {
+        "First Successful Funding",
+        "Last Successful Funding",
+    }
 
     for row_number, row in enumerate(rows, start=table_row + 1):
         for column, header in enumerate(headers):
             value = row[header]
+
             if header in integer_headers:
-                ws.write_number(row_number, column, int(value), formats['integer'])
+                ws.write_number(row_number, column, int(value), formats["integer"])
             elif header in money_headers:
-                ws.write_number(row_number, column, float(value), formats['money'])
-            elif header == 'Successful Funding Rate':
-                ws.write_number(row_number, column, float(value), formats['percent'])
+                ws.write_number(row_number, column, float(value), formats["money"])
+            elif header == "Successful Funding Rate":
+                ws.write_number(row_number, column, float(value), formats["percent"])
             elif header in date_headers:
-                ws.write_datetime(row_number, column, value.replace(tzinfo=None), formats['date'])
+                ws.write_datetime(
+                    row_number,
+                    column,
+                    value.replace(tzinfo=None),
+                    formats["date"],
+                )
             else:
-                ws.write(row_number, column, value, formats['body_wrap'] if column in {0, 15, 16, 17, 18, 19, 20} else formats['body'])
+                ws.write(
+                    row_number,
+                    column,
+                    value,
+                    formats["body_wrap"]
+                    if column in {0, 13, 14, 15, 16, 17, 18}
+                    else formats["body"],
+                )
 
     if rows:
         ws.add_table(
-            table_row, 0, table_row + len(rows), len(headers) - 1,
+            table_row,
+            0,
+            table_row + len(rows),
+            len(headers) - 1,
             {
-                'name': 'DonorAnalysisTable',
-                'style': 'Table Style Medium 2',
-                'columns': [{'header': h} for h in headers],
+                "name": "DonorAnalysisTable",
+                "style": "Table Style Medium 2",
+                "columns": [{"header": header} for header in headers],
             },
         )
-        failed_col = headers.index('Failed / Unsuccessful Count')
-        pending_col = headers.index('Pending Validation Count')
-        ws.conditional_format(table_row + 1, failed_col, table_row + len(rows), failed_col, {
-            'type': 'cell', 'criteria': '>', 'value': 0, 'format': formats['failed']
-        })
-        ws.conditional_format(table_row + 1, pending_col, table_row + len(rows), pending_col, {
-            'type': 'cell', 'criteria': '>', 'value': 0, 'format': formats['pending']
-        })
 
-    widths = [30, 10, 18, 14, 20, 21, 20, 18, 20, 19, 20, 20, 19, 20, 20, 26, 34, 28, 31, 27, 28]
+        failed_col = headers.index("Failed / Unsuccessful Count")
+        pending_col = headers.index("Pending Validation Count")
+
+        ws.conditional_format(
+            table_row + 1,
+            failed_col,
+            table_row + len(rows),
+            failed_col,
+            {
+                "type": "cell",
+                "criteria": ">",
+                "value": 0,
+                "format": formats["failed"],
+            },
+        )
+
+        ws.conditional_format(
+            table_row + 1,
+            pending_col,
+            table_row + len(rows),
+            pending_col,
+            {
+                "type": "cell",
+                "criteria": ">",
+                "value": 0,
+                "format": formats["pending"],
+            },
+        )
+
+    widths = [
+        30, 10, 18, 22, 20, 22, 21, 21, 22, 21,
+        18, 14, 20, 27, 35, 28, 31, 27, 30,
+    ]
+
     for column, width in enumerate(widths):
         ws.set_column(column, column, width)
+
     ws.freeze_panes(table_row + 1, 0)
 
 
@@ -3029,12 +3220,12 @@ def main():
             donor_metrics = donor_summary_metrics(selected)
             donor_rows = build_donor_analysis(selected)
 
-            st.subheader("Donor / Funder Preview")
+            st.subheader("Successful Donor / Funder Summary")
             d1, d2, d3, d4 = st.columns(4)
-            d1.metric("Unique donors", donor_metrics["unique_donors"])
-            d2.metric("Successful donors", donor_metrics["successful_donors"])
+            d1.metric("Successful donors", donor_metrics["successful_donors"])
+            d2.metric("Successful funding transactions", donor_metrics["successful_funding_transactions"])
             d3.metric("Repeat donors", donor_metrics["repeat_donors"])
-            d4.metric("Donors with failed attempts", donor_metrics["donors_with_failures"])
+            d4.metric("Successful donors with failed attempts", donor_metrics["donors_with_failures"])
 
             if donor_rows:
                 preview_rows = [
@@ -3042,10 +3233,10 @@ def main():
                         "Donor / Funder": row["Donor / Funder"],
                         "Currency": row["Currency"],
                         "Successful Funding Count": row["Successful Funding Count"],
+                        "Total Amount Funded": row["Total Amount Funded"],
+                        "Average Successful Funding": row["Average Successful Funding"],
                         "Failed / Unsuccessful Count": row["Failed / Unsuccessful Count"],
                         "Pending Validation Count": row["Pending Validation Count"],
-                        "Total Amount Funded": row["Total Amount Funded"],
-                        "Successful Funding Rate": row["Successful Funding Rate"],
                     }
                     for row in donor_rows[:25]
                 ]
